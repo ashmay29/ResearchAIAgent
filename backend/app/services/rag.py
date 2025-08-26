@@ -3,11 +3,15 @@ from typing import List, Iterable
 import hashlib
 import time
 import os
+from collections import OrderedDict
 
 import google.generativeai as genai
 from pinecone import Pinecone, ServerlessSpec
 
 from ..config import settings
+from ..utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def _lazy_genai_configured() -> bool:
@@ -18,37 +22,61 @@ def _lazy_genai_configured() -> bool:
     return True
 
 
+def _truncate_bytes(text: str, max_bytes: int) -> str:
+    b = text.encode("utf-8")
+    if len(b) <= max_bytes:
+        return text
+    return b[:max_bytes].decode("utf-8", errors="ignore")
+
+
 def _embedding_for(text: str) -> List[float]:
     if not _lazy_genai_configured():
         raise RuntimeError("GEMINI_API_KEY not configured")
-    model = settings.gemini_embedding_model or "text-embedding-004"
-    # google-genai expects model name prefixed with 'models/'
+    model = (settings.gemini_embedding_model or "text-embedding-004").strip()
     model_name = model if model.startswith("models/") else f"models/{model}"
-    resp = genai.embed_content(model=model_name, content=text)
-    return resp["embedding"] if isinstance(resp, dict) else resp.embedding  # type: ignore
+    safe_text = _truncate_bytes(text, int(getattr(settings, "gemini_emb_trunc_bytes", 24_000)))
+
+    # In-process LRU cache to avoid duplicate calls for identical content
+    global _EMB_CACHE
+    if '_EMB_CACHE' not in globals():
+        _EMB_CACHE = OrderedDict()  # type: ignore[var-annotated]
+    cache_max = int(os.getenv("GEMINI_EMB_CACHE_SIZE", "256"))
+    key = hashlib.sha1(safe_text.encode("utf-8")).hexdigest()
+    if key in _EMB_CACHE:
+        # move to end (recently used)
+        _EMB_CACHE.move_to_end(key)
+        return _EMB_CACHE[key]
+
+    max_retries = int(getattr(settings, "gemini_max_retries", 3))
+    backoff = float(getattr(settings, "gemini_retry_backoff", 1.0))
+    last_err: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = genai.embed_content(model=model_name, content=safe_text)
+            emb = resp["embedding"] if isinstance(resp, dict) else resp.embedding  # type: ignore
+            # store in LRU cache
+            _EMB_CACHE[key] = emb
+            if len(_EMB_CACHE) > cache_max:
+                _EMB_CACHE.popitem(last=False)
+            return emb
+        except Exception as e:  # broad catch to log and retry
+            last_err = e
+            logger.warning(f"Embedding attempt {attempt}/{max_retries} failed: {e}")
+            if attempt < max_retries:
+                time.sleep(backoff * attempt)
+            else:
+                break
+    raise RuntimeError(f"Embedding failed after {max_retries} retries: {last_err}")
 
 
-def _chunk(text: str, max_tokens: int = 800) -> List[str]:
-    # naive splitter by paragraphs; fallback to fixed-size chunks
-    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+def _chunk(text: str, max_bytes: int = 6000) -> List[str]:
+    # Byte-based chunking to satisfy embedding payload limits.
+    b = text.encode("utf-8")
     chunks: List[str] = []
-    current: List[str] = []
-    tokens = 0
-    for p in paras:
-        ptoks = max(1, len(p.split()))
-        if tokens + ptoks > max_tokens and current:
-            chunks.append("\n\n".join(current))
-            current, tokens = [p], ptoks
-        else:
-            current.append(p)
-            tokens += ptoks
-    if current:
-        chunks.append("\n\n".join(current))
-    # if text had no paras, do fixed chunks
-    if not chunks:
-        words = text.split()
-        for i in range(0, len(words), max_tokens):
-            chunks.append(" ".join(words[i : i + max_tokens]))
+    for i in range(0, len(b), max_bytes):
+        piece = b[i : i + max_bytes].decode("utf-8", errors="ignore")
+        if piece.strip():
+            chunks.append(piece)
     return chunks
 
 
@@ -58,11 +86,26 @@ class PineconeVectorStore:
             raise RuntimeError("PINECONE_API_KEY not configured")
         self.pc = Pinecone(api_key=settings.pinecone_api_key)
         self.index_name = settings.pinecone_index
+        # Decide whether we need to probe Gemini for embedding dimension
         existing = {idx.name for idx in self.pc.list_indexes()}
-        if self.index_name not in existing:
+        need_index = self.index_name not in existing
+        env_dim_raw = os.getenv("PINECONE_DIM")
+        have_env_dim = bool(env_dim_raw)
+
+        detected_emb_dim: int | None = None
+        if need_index and not have_env_dim and settings.gemini_probe_on_startup:
+            try:
+                probe = _embedding_for("__dimension_probe__")
+                detected_emb_dim = len(probe)
+            except Exception as e:
+                logger.warning(f"Embedding dim probe skipped/fallback (startup): {e}")
+
+        desired_dim = int(env_dim_raw) if have_env_dim else int(detected_emb_dim or getattr(settings, "pinecone_dim", 1536))
+
+        if need_index:
             self.pc.create_index(
                 name=self.index_name,
-                dimension=3072,  # Gemini text-embedding-004 dimension
+                dimension=desired_dim,
                 metric="cosine",
                 spec=ServerlessSpec(cloud=settings.pinecone_cloud, region=settings.pinecone_region),
             )
@@ -70,6 +113,23 @@ class PineconeVectorStore:
             while not self.pc.describe_index(self.index_name).status["ready"]:  # type: ignore
                 time.sleep(1)
         self.index = self.pc.Index(self.index_name)
+
+        # Optionally verify at startup (can make a Gemini call). Disabled by default.
+        if settings.gemini_verify_dim:
+            try:
+                emb_dim = len(_embedding_for("__dimension_probe__"))
+                if emb_dim != int(desired_dim):
+                    msg = (
+                        f"Embedding dim ({emb_dim}) does not match Pinecone index dim ({desired_dim}). "
+                        f"Set PINECONE_DIM to {emb_dim} or switch embedding model to match. Current EMB model: '{settings.gemini_embedding_model}'."
+                    )
+                    logger.error(msg)
+                    raise RuntimeError(msg)
+                else:
+                    logger.info(f"Embedding dimension verified: {emb_dim}")
+            except Exception as e:
+                if not isinstance(e, RuntimeError):
+                    logger.warning(f"Could not verify embedding dimension at startup: {e}")
 
     def add(self, texts: List[str], namespace: str | None = None, metadata: dict | None = None, base_id: str | None = None):
         vects = []
@@ -99,5 +159,18 @@ class PineconeVectorStore:
         return out
 
 
-# Singleton store
-store = PineconeVectorStore()
+class _LazyPineconeStore:
+    def __init__(self):
+        self._inst: PineconeVectorStore | None = None
+
+    def _ensure(self) -> PineconeVectorStore:
+        if self._inst is None:
+            self._inst = PineconeVectorStore()
+        return self._inst
+
+    def __getattr__(self, name):
+        return getattr(self._ensure(), name)
+
+
+# Lazy singleton proxy; no initialization work until first use
+store = _LazyPineconeStore()

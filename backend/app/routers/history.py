@@ -1,11 +1,10 @@
 from fastapi import APIRouter
-from .analysis import JOBS
+from ..utils.session_store import list_sessions
 
 router = APIRouter()
 
 @router.get("/list")
 def list_history():
-    items = []
-    for job_id, job in JOBS.items():
-        items.append({"id": job_id, "status": job["status"]})
+    sessions = list_sessions()
+    items = [{"id": s.get("session_id") or s.get("paper_id"), "status": s.get("status", "done")} for s in sessions]
     return {"items": items}

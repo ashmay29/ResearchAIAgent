@@ -9,3 +9,5 @@ backend/app/services/__pycache__
 backend/app/utils/__pycache__
 backend/app/agents/__pycache__
 backend/storage
+
+backend/.env

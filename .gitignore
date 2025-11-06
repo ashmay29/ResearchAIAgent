@@ -11,3 +11,5 @@ backend/app/agents/__pycache__
 backend/storage
 
 backend/.env
+
+*.md

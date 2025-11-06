@@ -8,11 +8,14 @@ class Settings(BaseModel):
     arxiv_api_base: str = os.getenv("ARXIV_API_BASE", "http://export.arxiv.org/api/query")
     # Gemini
     gemini_api_key: str | None = os.getenv("GEMINI_API_KEY")
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
     gemini_embedding_model: str = os.getenv("GEMINI_EMBED_MODEL", "text-embedding-004")
     gemini_max_retries: int = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
     gemini_retry_backoff: float = float(os.getenv("GEMINI_RETRY_BACKOFF", "1.0"))
-    gemini_gen_chunk_bytes: int = int(os.getenv("GEMINI_GEN_CHUNK_BYTES", "15000"))
+    gemini_gen_chunk_bytes: int = int(os.getenv("GEMINI_GEN_CHUNK_BYTES", "6000"))
+    gemini_max_output_tokens: int = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
+    gemini_max_context_bytes: int = int(os.getenv("GEMINI_MAX_CONTEXT_BYTES", "5000"))
+    gemini_max_total_bytes: int = int(os.getenv("GEMINI_MAX_TOTAL_BYTES", "30000"))
     gemini_emb_trunc_bytes: int = int(os.getenv("GEMINI_EMB_TRUNC_BYTES", "24000"))
     gemini_probe_on_startup: bool = os.getenv("GEMINI_PROBE_ON_STARTUP", "false").lower() in {"1", "true", "yes"}
     gemini_verify_dim: bool = os.getenv("GEMINI_VERIFY_DIM", "false").lower() in {"1", "true", "yes"}

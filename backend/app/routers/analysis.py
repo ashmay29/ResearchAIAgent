@@ -10,20 +10,38 @@ router = APIRouter()
 
 @router.post("/run")
 def run_analysis(payload: AnalysisRequest):
+    from ..utils.logger import get_logger
+    logger = get_logger(__name__)
+    
+    logger.info(f"[ENDPOINT] POST /analysis/run received for paper_id={payload.paper_id}")
+    
     paper = PAPERS.get(payload.paper_id)
     if not paper:
+        logger.error(f"[ENDPOINT] Paper not found: {payload.paper_id}")
         raise HTTPException(status_code=404, detail="Paper not found")
-    # Run synchronously for now
-    result = pipeline.run(paper["path"], payload.options or AnalysisOptions(), paper_id=payload.paper_id)
-    # Persist session (compat: use paper_id as session id)
-    job_id = payload.paper_id
-    save_session(job_id, {
-        "paper_id": payload.paper_id,
-        "options": payload.options.dict() if hasattr(payload.options, "dict") else (payload.options or {}),
-        "status": "done",
-        "result": result,
-    })
-    return {"job_id": job_id}
+    
+    try:
+        # Run synchronously for now
+        logger.info(f"[ENDPOINT] Starting pipeline execution for paper_id={payload.paper_id}")
+        result = pipeline.run(paper["path"], payload.options or AnalysisOptions(), paper_id=payload.paper_id)
+        
+        # Persist session (compat: use paper_id as session id)
+        job_id = payload.paper_id
+        # Use Pydantic v2 model_dump() instead of dict()
+        options_dict = payload.options.model_dump() if payload.options else {}
+        save_session(job_id, {
+            "paper_id": payload.paper_id,
+            "options": options_dict,
+            "status": "done",
+            "result": result,
+        })
+        
+        logger.info(f"[ENDPOINT] Analysis successful for paper_id={payload.paper_id}")
+        return {"job_id": job_id}
+        
+    except Exception as e:
+        logger.error(f"[ENDPOINT] Analysis failed for paper_id={payload.paper_id}: {e}")
+        raise
 
 @router.get("/status/{job_id}")
 def status(job_id: str):

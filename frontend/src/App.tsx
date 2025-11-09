@@ -3,9 +3,6 @@ import Navbar from './components/Navbar'
 import Home from './pages/Home'
 import AnalysisResult from './pages/AnalysisResult'
 import History from './pages/History'
-import Settings from './pages/Settings'
-import Login from './pages/Login'
-import Signup from './pages/Signup'
 
 function App() {
   return (
@@ -16,9 +13,6 @@ function App() {
           <Route path="/" element={<Home />} />
           <Route path="/analysis/:jobId" element={<AnalysisResult />} />
           <Route path="/history" element={<History />} />
-          <Route path="/settings" element={<Settings />} />
-          <Route path="/login" element={<Login />} />
-          <Route path="/signup" element={<Signup />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>

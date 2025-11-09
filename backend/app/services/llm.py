@@ -150,12 +150,69 @@ def _parse_structured_response(response_text: str) -> Dict[str, any]:
 
 
 class LLMClient:
-    def analyze_all_sections(self, text: str, style: str = "medium", context: str = "") -> Dict[str, any]:
+    def extract_key_content(self, text: str, context: str = "", max_output_tokens: int = 512) -> str:
         """
-        Consolidated method that makes ONE Gemini call per chunk to generate all sections.
-        Reduces API calls from 4+ per chunk to 1 per chunk.
+        Phase 1: Extract the most important content from the entire paper.
+        Reduces large papers to ~10-15% of original size for efficient analysis.
+        """
+        global _api_call_counter
         
-        Returns dict with keys: summary, critique, key_findings (list), citations (list)
+        text_bytes = len(text.encode('utf-8'))
+        logger.info(f"[EXTRACT_START] Extracting key content from {text_bytes} bytes of text")
+        
+        prompt = f"""You are analyzing a research paper. Extract ONLY the most important content for comprehensive analysis.
+
+**Context from paper:**
+{context[:2000] if context else ""}
+
+**Full Paper Text:**
+{text}
+
+Please extract and return:
+1. Abstract/Introduction (key claims and objectives)
+2. Core methodology (how they did it)
+3. Main results/findings (what they discovered)
+4. Key limitations or caveats mentioned
+5. Conclusion/implications
+
+Format as a condensed version preserving the most critical information. Remove:
+- Redundant explanations
+- Extended literature review details  
+- Detailed mathematical proofs (keep only key equations if essential)
+- Extensive citations (keep only seminal ones)
+- Boilerplate text
+
+Target length: 5,000-10,000 characters of the most information-dense content."""
+        
+        parts = [{"text": prompt}]
+        
+        try:
+            extracted = _gen_with_retry(
+                parts, 
+                max_output_tokens=max_output_tokens,
+                call_info="(Key Content Extraction)"
+            )
+            
+            extracted_bytes = len(extracted.encode('utf-8'))
+            reduction_pct = (extracted_bytes / text_bytes) * 100 if text_bytes > 0 else 0
+            
+            logger.info(f"[EXTRACT_COMPLETE] Extraction successful")
+            logger.info(f"Reduced from {text_bytes} to {extracted_bytes} bytes ({reduction_pct:.1f}% of original)")
+            
+            return extracted
+            
+        except Exception as e:
+            logger.error(f"[EXTRACT_FAILED] Extraction failed: {e}")
+            logger.warning("Falling back to first 10KB of text")
+            return text[:10000]
+    
+    def analyze_all_sections(self, text: str, style: str = "medium", context: str = "", extract_first: bool = True) -> Dict[str, any]:
+        """
+        Extract-then-analyze strategy: 1-2 API calls per paper regardless of size.
+        
+        Strategy:
+        - Small papers (<30KB): 1 API call (direct analysis)
+        - Large papers (≥30KB): 2 API calls (extract key content, then analyze)
         """
         global _api_call_counter
         analysis_start = time.time()
@@ -163,126 +220,109 @@ class LLMClient:
         
         logger.info(f"[CONSOLIDATED_ANALYSIS_START] Beginning consolidated analysis with style='{style}'")
         
-        # Truncate context to safe size
+        # Determine if we should extract first
+        text_size = len(text.encode('utf-8'))
+        logger.info(f"Paper text size: {text_size} bytes")
+        
+        # Decision logic: Extract if paper is large
+        should_extract = extract_first and text_size > settings.gemini_extract_threshold
+        
+        if should_extract:
+            logger.info(f"[STRATEGY] Large paper detected (>{settings.gemini_extract_threshold} bytes) - using extract-then-analyze strategy")
+            # Phase 1: Extract key content
+            text_to_analyze = self.extract_key_content(text, context, max_output_tokens=512)
+            logger.info(f"[STRATEGY] Will analyze extracted content: {len(text_to_analyze.encode('utf-8'))} bytes")
+        else:
+            logger.info(f"[STRATEGY] Small paper (<={settings.gemini_extract_threshold} bytes) - analyzing directly without extraction")
+            text_to_analyze = text
+        
+        # Phase 2: Full analysis on (possibly extracted) content
         safe_context = _truncate_bytes(context, settings.gemini_max_context_bytes)
         
-        # Build structured prompt template
-        prompt_template = """You are analyzing a research paper. Based on the excerpt below and the provided context, generate a comprehensive analysis with the following sections:
+        # Map style to description
+        style_map = {
+            "concise": "brief, focusing only on essential points",
+            "medium": "balanced, covering main points with reasonable detail",
+            "detailed": "comprehensive, exploring nuances and implications",
+            "comprehensive": "exhaustive, covering all aspects in depth"
+        }
+        style_desc = style_map.get(style, style)
+        
+        # Build comprehensive prompt for final analysis
+        prompt = f"""You are analyzing a research paper. Provide a comprehensive analysis with the following sections.
 
-**Style for summary**: {style} (concise/detailed/comprehensive)
+**Analysis Style**: {style_desc}
 
-**Context from paper**:
-{context}
+**Context from paper:**
+{safe_context}
 
-**Paper Excerpt**:
-{chunk}
+**Paper Content:**
+{text_to_analyze}
 
 Please provide your analysis in this EXACT format with clear delimiters:
 
 === SUMMARY ===
-[Write a {style} summary of this excerpt, focusing on the main contributions and methodology]
+Provide a {style_desc} summary covering:
+- Main research question/objective
+- Methodology approach
+- Key results and findings
+- Main contributions to the field
 
 === CRITIQUE ===
-[Provide critical analysis: What are the strengths? What are potential limitations or weaknesses in methodology, assumptions, or claims?]
+Provide critical analysis addressing:
+- Strengths: What does this paper do well? Novel contributions?
+- Limitations: What are the methodological limitations or assumptions?
+- Validity: How strong is the evidence? Any concerns about conclusions?
+- Impact: Significance and potential influence of this work
 
 === KEY FINDINGS ===
-- [Key finding 1]
-- [Key finding 2]
-- [Key finding 3]
-[List 3-5 main discoveries or results from this excerpt]
+List 3-5 most important findings as bullet points:
+- [Most important discovery or result]
+- [Second key finding]
+- [Additional findings...]
+
+Focus on concrete, specific findings rather than general statements.
 
 === CITATIONS ===
-- [Citation 1]
-- [Citation 2]
-[List important references or works cited in this excerpt]
+List the most important references cited (up to 5):
+- [Key citation 1 - Author(s), Year, Brief relevance]
+- [Key citation 2]
+- ...
 
-Ensure each section is clearly separated by the delimiter lines."""
+Only include citations that are central to understanding this work.
+
+Remember to use the EXACT delimiter format shown above."""
         
-        # Calculate safe chunk size
-        base_prompt = prompt_template.format(style=style, context=safe_context, chunk="")
-        max_total = settings.gemini_max_total_bytes
-        safe_chunk_size = _calculate_safe_chunk_size(base_prompt, safe_context, max_total)
+        parts = [{"text": prompt}]
         
-        # Chunk the text
-        chunks = _chunk_bytes(text, safe_chunk_size)
-        total_chunks = len(chunks)
+        logger.info(f"[API_CALL_START] GEMINI_FINAL_ANALYSIS")
         
-        logger.info(f"Text split into {total_chunks} chunks of ~{safe_chunk_size} bytes each")
-        
-        # Aggregate results across chunks
-        all_summaries = []
-        all_critiques = []
-        all_findings = []
-        all_citations = []
-        
-        for chunk_idx, chunk in enumerate(chunks, 1):
-            # Build prompt for this chunk
-            prompt = prompt_template.format(
-                style=style,
-                context=safe_context if chunk_idx == 1 else "",  # Only include context in first chunk
-                chunk=chunk
-            )
-            
-            parts = [{"text": prompt}]
-            call_info = f"for chunk {chunk_idx}/{total_chunks}"
-            
-            # Make single consolidated API call
+        try:
             response_text = _gen_with_retry(
                 parts, 
                 max_output_tokens=settings.gemini_max_output_tokens,
-                call_info=call_info
+                call_info="(Final Analysis)"
             )
             
-            # Parse structured response
+            # Parse the structured response
             parsed = _parse_structured_response(response_text)
             
-            # Aggregate results
-            if parsed["summary"]:
-                all_summaries.append(parsed["summary"])
-            if parsed["critique"]:
-                all_critiques.append(parsed["critique"])
-            if parsed["key_findings"]:
-                all_findings.extend(parsed["key_findings"])
-            if parsed["citations"]:
-                all_citations.extend(parsed["citations"])
-        
-        # Deduplicate findings and citations while preserving order
-        unique_findings = []
-        seen_findings = set()
-        for f in all_findings:
-            f_lower = f.lower()
-            if f_lower not in seen_findings:
-                seen_findings.add(f_lower)
-                unique_findings.append(f)
-        
-        unique_citations = []
-        seen_citations = set()
-        for c in all_citations:
-            c_lower = c.lower()
-            if c_lower not in seen_citations:
-                seen_citations.add(c_lower)
-                unique_citations.append(c)
-        
-        # Limit to top results
-        final_findings = unique_findings[:5]
-        final_citations = unique_citations[:5]
-        
-        # Combine summaries and critiques
-        final_summary = "\n\n".join(all_summaries)
-        final_critique = "\n\n".join(all_critiques)
-        
-        total_duration = time.time() - analysis_start
-        total_calls = _api_call_counter - initial_call_count
-        
-        logger.info(f"[CONSOLIDATED_ANALYSIS_COMPLETE] Total Gemini API calls: {total_calls}, Total duration: {total_duration:.2f}s")
-        logger.info(f"Generated summary: {len(final_summary)} chars, critique: {len(final_critique)} chars, findings: {len(final_findings)}, citations: {len(final_citations)}")
-        
-        return {
-            "summary": final_summary,
-            "critique": final_critique,
-            "key_findings": final_findings,
-            "citations": final_citations
-        }
+            total_duration = time.time() - analysis_start
+            total_calls = _api_call_counter - initial_call_count
+            
+            logger.info(f"[CONSOLIDATED_ANALYSIS_COMPLETE] Total Gemini API calls: {total_calls}, Total duration: {total_duration:.2f}s")
+            logger.info(f"Generated summary: {len(parsed['summary'])} chars, critique: {len(parsed['critique'])} chars, findings: {len(parsed['key_findings'])}, citations: {len(parsed['citations'])}")
+            
+            return parsed
+            
+        except Exception as e:
+            logger.error(f"[CONSOLIDATED_ANALYSIS_FAILED] Analysis failed: {e}")
+            return {
+                "summary": "Analysis failed. Please try again.",
+                "critique": "",
+                "key_findings": [],
+                "citations": []
+            }
     
     def summarize(self, text: str, style: str = "medium", context: Optional[str] = None) -> str:
         prompt = (

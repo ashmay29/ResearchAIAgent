@@ -16,6 +16,7 @@ class Settings(BaseModel):
     gemini_max_output_tokens: int = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
     gemini_max_context_bytes: int = int(os.getenv("GEMINI_MAX_CONTEXT_BYTES", "5000"))
     gemini_max_total_bytes: int = int(os.getenv("GEMINI_MAX_TOTAL_BYTES", "30000"))
+    gemini_extract_threshold: int = int(os.getenv("GEMINI_EXTRACT_THRESHOLD", "30000"))
     gemini_emb_trunc_bytes: int = int(os.getenv("GEMINI_EMB_TRUNC_BYTES", "24000"))
     gemini_probe_on_startup: bool = os.getenv("GEMINI_PROBE_ON_STARTUP", "false").lower() in {"1", "true", "yes"}
     gemini_verify_dim: bool = os.getenv("GEMINI_VERIFY_DIM", "false").lower() in {"1", "true", "yes"}

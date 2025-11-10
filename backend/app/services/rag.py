@@ -9,16 +9,19 @@ import google.generativeai as genai
 from pinecone import Pinecone, ServerlessSpec
 
 from ..config import settings
-from ..utils.logger import get_logger
+from ..utils.logger import get_logger, track_api_call
 
 logger = get_logger(__name__)
+
+# OPTIMIZATION 1: Batch embedding cache across process
+_EMB_CACHE = OrderedDict()
+_BATCH_CACHE_SIZE = 512  # Increased cache size
 
 
 def _lazy_genai_configured() -> bool:
     api = settings.gemini_api_key
     if not api:
         return False
-    genai.configure(api_key=api)
     return True
 
 
@@ -29,54 +32,135 @@ def _truncate_bytes(text: str, max_bytes: int) -> str:
     return b[:max_bytes].decode("utf-8", errors="ignore")
 
 
-def _embedding_for(text: str) -> List[float]:
+# OPTIMIZATION 2: Batch embedding API
+@track_api_call("GEMINI_EMBEDDING_BATCH")
+def _embedding_for_batch(texts: List[str]) -> List[List[float]]:
+    """Embed multiple texts in a single API call using task_type batching."""
     if not _lazy_genai_configured():
         raise RuntimeError("GEMINI_API_KEY not configured")
+    
+    if not texts:
+        return []
+    
     model = (settings.gemini_embedding_model or "text-embedding-004").strip()
     model_name = model if model.startswith("models/") else f"models/{model}"
-    safe_text = _truncate_bytes(text, int(getattr(settings, "gemini_emb_trunc_bytes", 24_000)))
-
-    # In-process LRU cache to avoid duplicate calls for identical content
-    global _EMB_CACHE
-    if '_EMB_CACHE' not in globals():
-        _EMB_CACHE = OrderedDict()  # type: ignore[var-annotated]
-    cache_max = int(os.getenv("GEMINI_EMB_CACHE_SIZE", "256"))
-    key = hashlib.sha1(safe_text.encode("utf-8")).hexdigest()
-    if key in _EMB_CACHE:
-        # move to end (recently used)
-        _EMB_CACHE.move_to_end(key)
-        return _EMB_CACHE[key]
-
-    max_retries = int(getattr(settings, "gemini_max_retries", 3))
-    backoff = float(getattr(settings, "gemini_retry_backoff", 1.0))
-    last_err: Exception | None = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = genai.embed_content(model=model_name, content=safe_text)
-            emb = resp["embedding"] if isinstance(resp, dict) else resp.embedding  # type: ignore
-            # store in LRU cache
-            _EMB_CACHE[key] = emb
-            if len(_EMB_CACHE) > cache_max:
-                _EMB_CACHE.popitem(last=False)
-            return emb
-        except Exception as e:  # broad catch to log and retry
-            last_err = e
-            logger.warning(f"Embedding attempt {attempt}/{max_retries} failed: {e}")
-            if attempt < max_retries:
-                time.sleep(backoff * attempt)
-            else:
+    
+    # Truncate all texts
+    safe_texts = [_truncate_bytes(t, int(getattr(settings, "gemini_emb_trunc_bytes", 24_000))) for t in texts]
+    
+    # Check cache first
+    uncached_indices = []
+    results = [None] * len(texts)
+    
+    for i, text in enumerate(safe_texts):
+        key = hashlib.sha1(text.encode("utf-8")).hexdigest()
+        if key in _EMB_CACHE:
+            _EMB_CACHE.move_to_end(key)
+            results[i] = _EMB_CACHE[key]
+        else:
+            uncached_indices.append(i)
+    
+    # Batch embed uncached texts
+    if uncached_indices:
+        uncached_texts = [safe_texts[i] for i in uncached_indices]
+        
+        max_retries = int(getattr(settings, "gemini_max_retries", 3))
+        backoff = float(getattr(settings, "gemini_retry_backoff", 1.0))
+        last_err = None
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Use batch embed_content with task_type
+                resp = genai.embed_content(
+                    model=model_name,
+                    content=uncached_texts,
+                    task_type="RETRIEVAL_DOCUMENT"  # Optimize for retrieval
+                )
+                
+                # Extract embeddings - handle different response formats
+                if isinstance(resp, dict):
+                    embeddings = resp.get("embeddings", resp.get("embedding", []))
+                else:
+                    embeddings = resp.embeddings if hasattr(resp, 'embeddings') else [resp.embedding]
+                
+                # Cache and fill results
+                for i, idx in enumerate(uncached_indices):
+                    # Handle different embedding formats
+                    if isinstance(embeddings[i], list):
+                        emb = embeddings[i]
+                    elif isinstance(embeddings[i], dict):
+                        emb = embeddings[i].get("values", embeddings[i].get("embedding", []))
+                    else:
+                        emb = embeddings[i].values if hasattr(embeddings[i], 'values') else embeddings[i].embedding
+                    
+                    results[idx] = emb
+                    
+                    # Update cache
+                    key = hashlib.sha1(safe_texts[idx].encode("utf-8")).hexdigest()
+                    _EMB_CACHE[key] = emb
+                    if len(_EMB_CACHE) > _BATCH_CACHE_SIZE:
+                        _EMB_CACHE.popitem(last=False)
+                
+                logger.info(f"Batch embedded {len(uncached_indices)} texts, {len(results) - len(uncached_indices)} from cache")
                 break
-    raise RuntimeError(f"Embedding failed after {max_retries} retries: {last_err}")
+                
+            except Exception as e:
+                last_err = e
+                logger.warning(f"Batch embedding attempt {attempt}/{max_retries} failed: {e}")
+                if attempt < max_retries:
+                    time.sleep(backoff * attempt)
+        
+        if any(r is None for r in results):
+            raise RuntimeError(f"Batch embedding failed after {max_retries} retries: {last_err}")
+    else:
+        logger.info(f"All {len(texts)} texts retrieved from cache")
+    
+    return results
 
 
-def _chunk(text: str, max_bytes: int = 6000) -> List[str]:
-    # Byte-based chunking to satisfy embedding payload limits.
+def _embedding_for(text: str) -> List[float]:
+    """Single text embedding (uses batch API under the hood)."""
+    return _embedding_for_batch([text])[0]
+
+
+# OPTIMIZATION 3: Smarter chunking with overlap for better context
+def _chunk_with_overlap(text: str, max_bytes: int = 9000, overlap_bytes: int = 300) -> List[str]:
+    """
+    Chunk text with overlap to preserve context at boundaries.
+    Increased default chunk size from 6000 to 9000 to reduce total chunks by ~25%.
+    """
     b = text.encode("utf-8")
     chunks: List[str] = []
-    for i in range(0, len(b), max_bytes):
-        piece = b[i : i + max_bytes].decode("utf-8", errors="ignore")
-        if piece.strip():
-            chunks.append(piece)
+    
+    if len(b) <= max_bytes:
+        return [text]
+    
+    i = 0
+    while i < len(b):
+        end = min(i + max_bytes, len(b))
+        chunk_bytes = b[i:end]
+        
+        # Try to break at sentence boundary if not at end
+        if end < len(b):
+            # Look for sentence endings in the last 200 bytes
+            last_section = chunk_bytes[-200:]
+            for sep in [b'. ', b'.\n', b'! ', b'? ', b'\n\n']:
+                idx = last_section.rfind(sep)
+                if idx != -1:
+                    # Adjust end to sentence boundary
+                    actual_end = i + len(chunk_bytes) - 200 + idx + len(sep)
+                    chunk_bytes = b[i:actual_end]
+                    break
+        
+        chunk_text = chunk_bytes.decode("utf-8", errors="ignore").strip()
+        if chunk_text:
+            chunks.append(chunk_text)
+        
+        # Move forward with overlap
+        i += len(chunk_bytes) - overlap_bytes if end < len(b) else len(chunk_bytes)
+    
+    old_strategy_chunks = len(b) // 6000 + (1 if len(b) % 6000 else 0)
+    logger.info(f"Chunked {len(b)} bytes into {len(chunks)} chunks (old strategy: ~{old_strategy_chunks}, saved {old_strategy_chunks - len(chunks)} chunks)")
     return chunks
 
 
@@ -131,20 +215,42 @@ class PineconeVectorStore:
                 if not isinstance(e, RuntimeError):
                     logger.warning(f"Could not verify embedding dimension at startup: {e}")
 
-    def add(self, texts: List[str], namespace: str | None = None, metadata: dict | None = None, base_id: str | None = None):
-        vects = []
+    @track_api_call("PINECONE_BATCH_UPSERT")
+    def add_batch(self, texts: List[str], namespace: str | None = None, metadata: dict | None = None, base_id: str | None = None):
+        """OPTIMIZATION 4: Batch embed and upsert in one go."""
+        if not texts:
+            return
+        
+        logger.info(f"Batch processing {len(texts)} chunks for embedding and upsert")
+        
+        # Single batch embedding call (HUGE OPTIMIZATION)
+        embeddings = _embedding_for_batch(texts)
+        
+        # Prepare vectors
         md = metadata or {}
-        for i, t in enumerate(texts):
-            emb = _embedding_for(t)
-            vid = base_id or hashlib.md5((t[:64] + str(i)).encode()).hexdigest()
-            vects.append({"id": f"{vid}-{i}", "values": emb, "metadata": {"text": t, **md}})
+        vects = []
+        for i, (txt, emb) in enumerate(zip(texts, embeddings)):
+            vid = base_id or hashlib.md5((txt[:64] + str(i)).encode()).hexdigest()
+            vects.append({
+                "id": f"{vid}-{i}",
+                "values": emb,
+                "metadata": {"text": txt, "chunk_index": i, **md}
+            })
+        
+        # Single upsert
         self.index.upsert(vectors=vects, namespace=namespace)
+        logger.info(f"Upserted {len(vects)} vectors in single batch (saved {len(vects)-1} API calls)")
 
     def add_document(self, doc_id: str, text: str, extra_meta: dict | None = None):
-        chunks = _chunk(text)
-        self.add(chunks, namespace="docs", metadata={"doc_id": doc_id, **(extra_meta or {})}, base_id=doc_id)
+        """OPTIMIZATION 5: Use improved chunking and batch operations."""
+        # Use 9000 byte chunks with 300 byte overlap (optimized from 6000 bytes)
+        chunks = _chunk_with_overlap(text, max_bytes=9000, overlap_bytes=300)
+        old_chunk_count = len(text.encode('utf-8')) // 6000 + 1
+        logger.info(f"Document {doc_id}: {len(chunks)} chunks (old: ~{old_chunk_count}, saved {old_chunk_count - len(chunks)} chunks)")
+        self.add_batch(chunks, namespace="docs", metadata={"doc_id": doc_id, **(extra_meta or {})}, base_id=doc_id)
 
     def query(self, q: str, k: int = 5, namespace: str | None = None, filter: dict | None = None) -> List[dict]:
+        """Query with single embedding call."""
         emb = _embedding_for(q)
         res = self.index.query(vector=emb, top_k=k, include_metadata=True, namespace=namespace or "docs", filter=filter)
         matches = getattr(res, "matches", []) or res.get("matches", [])  # type: ignore

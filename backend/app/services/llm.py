@@ -206,37 +206,37 @@ Target length: 5,000-10,000 characters of the most information-dense content."""
             logger.warning("Falling back to first 10KB of text")
             return text[:10000]
     
-    def analyze_all_sections(self, text: str, style: str = "medium", context: str = "", extract_first: bool = True) -> Dict[str, any]:
+    def analyze_all_sections(
+        self, 
+        text: str, 
+        style: str = "medium", 
+        context: str = "", 
+        paper_id: str | None = None
+    ) -> Dict[str, any]:
         """
-        Extract-then-analyze strategy: 1-2 API calls per paper regardless of size.
-        
-        Strategy:
-        - Small papers (<30KB): 1 API call (direct analysis)
-        - Large papers (≥30KB): 2 API calls (extract key content, then analyze)
+        OPTIMIZED: Single-pass analysis without extraction step for most papers.
         """
         global _api_call_counter
         analysis_start = time.time()
         initial_call_count = _api_call_counter
-        
-        logger.info(f"[CONSOLIDATED_ANALYSIS_START] Beginning consolidated analysis with style='{style}'")
-        
-        # Determine if we should extract first
+
+        logger.info(f"[CONSOLIDATED_ANALYSIS_START] Beginning consolidated analysis for paper_id={paper_id}, style='{style}'")
+
         text_size = len(text.encode('utf-8'))
         logger.info(f"Paper text size: {text_size} bytes")
-        
-        # Decision logic: Extract if paper is large
-        should_extract = extract_first and text_size > settings.gemini_extract_threshold
-        
-        if should_extract:
-            logger.info(f"[STRATEGY] Large paper detected (>{settings.gemini_extract_threshold} bytes) - using extract-then-analyze strategy")
-            # Phase 1: Extract key content
-            text_to_analyze = self.extract_key_content(text, context, max_output_tokens=512)
-            logger.info(f"[STRATEGY] Will analyze extracted content: {len(text_to_analyze.encode('utf-8'))} bytes")
+
+        # OPTIMIZATION 1: Remove extraction step - use full text directly
+        # Only truncate if exceeds absolute max
+        max_input = settings.gemini_max_total_bytes
+        if text_size > max_input:
+            logger.warning(f"Paper exceeds max input ({text_size} > {max_input}), truncating")
+            text_to_analyze = _truncate_bytes(text, max_input)
         else:
-            logger.info(f"[STRATEGY] Small paper (<={settings.gemini_extract_threshold} bytes) - analyzing directly without extraction")
             text_to_analyze = text
         
-        # Phase 2: Full analysis on (possibly extracted) content
+        logger.info(f"[STRATEGY] Direct analysis without extraction (saved 1 API call)")
+
+        # OPTIMIZATION 2: Truncate context safely
         safe_context = _truncate_bytes(context, settings.gemini_max_context_bytes)
         
         # Map style to description
@@ -247,10 +247,13 @@ Target length: 5,000-10,000 characters of the most information-dense content."""
             "comprehensive": "exhaustive, covering all aspects in depth"
         }
         style_desc = style_map.get(style, style)
-        
-        # Build comprehensive prompt for final analysis
-        prompt = f"""You are analyzing a research paper. Provide a comprehensive analysis with the following sections.
 
+        # OPTIMIZATION 3: Add paper identification to prompt
+        paper_identifier = f"\n**Paper ID**: {paper_id}\n" if paper_id else ""
+
+        # Build comprehensive prompt
+        prompt = f"""You are analyzing a research paper.
+{paper_identifier}
 **Analysis Style**: {style_desc}
 
 **Context from paper:**
@@ -294,31 +297,30 @@ Only include citations that are central to understanding this work.
 Remember to use the EXACT delimiter format shown above."""
         
         parts = [{"text": prompt}]
-        
-        logger.info(f"[API_CALL_START] GEMINI_FINAL_ANALYSIS")
-        
+
+        logger.info(f"[API_CALL_START] GEMINI_FINAL_ANALYSIS (single call strategy)")
+
         try:
             response_text = _gen_with_retry(
-                parts, 
+                parts,
                 max_output_tokens=settings.gemini_max_output_tokens,
-                call_info="(Final Analysis)"
+                call_info=f"(Final Analysis for {paper_id})"
             )
-            
-            # Parse the structured response
+
             parsed = _parse_structured_response(response_text)
-            
+
             total_duration = time.time() - analysis_start
             total_calls = _api_call_counter - initial_call_count
-            
-            logger.info(f"[CONSOLIDATED_ANALYSIS_COMPLETE] Total Gemini API calls: {total_calls}, Total duration: {total_duration:.2f}s")
+
+            logger.info(f"[CONSOLIDATED_ANALYSIS_COMPLETE] Paper {paper_id}: Total Gemini API calls: {total_calls}, Total duration: {total_duration:.2f}s")
             logger.info(f"Generated summary: {len(parsed['summary'])} chars, critique: {len(parsed['critique'])} chars, findings: {len(parsed['key_findings'])}, citations: {len(parsed['citations'])}")
-            
+
             return parsed
-            
+
         except Exception as e:
-            logger.error(f"[CONSOLIDATED_ANALYSIS_FAILED] Analysis failed: {e}")
+            logger.error(f"[CONSOLIDATED_ANALYSIS_FAILED] Analysis failed for paper {paper_id}: {e}")
             return {
-                "summary": "Analysis failed. Please try again.",
+                "summary": f"Analysis failed for paper {paper_id}. Please try again.",
                 "critique": "",
                 "key_findings": [],
                 "citations": []

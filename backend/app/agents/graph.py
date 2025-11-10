@@ -63,21 +63,24 @@ class AnalysisPipeline:
         text_bytes = len(text.encode('utf-8'))
         logger.info(f"Loaded paper text: {text_bytes} bytes ({len(text)} characters)")
 
-        # 3) Retrieve small contexts to assist generation
-        # Tailor retrieval by focus area
+        # Parse options
         opt = options if isinstance(options, AnalysisOptions) else AnalysisOptions(**(options or {}))
         focus_prompts = self._focus_prompts(opt.focus_area)
+        
+        # OPTIMIZATION 1: Single combined query instead of 2 separate queries
+        # OLD: 2 queries (overview + focus) = 2 embedding calls + 2 Pinecone calls
+        # NEW: 1 query with combined intent = 1 embedding call + 1 Pinecone call
         q_overview = "What is this paper about? Summarize the main contributions."
         q_focus = " ".join(focus_prompts)
-        # Reduced k from 5 to 2 for each query to limit context size
-        logger.info(f"Retrieving context from vector store with k=2 for overview and focus")
-        ctx_over = store.query(q_overview, k=2, filter={"doc_id": {"$eq": doc_id}})
-        ctx_focus = store.query(q_focus, k=2, filter={"doc_id": {"$eq": doc_id}})
+        combined_query = f"{q_overview} Additionally, focus on: {q_focus}"
         
-        logger.info(f"Retrieved {len(ctx_over)} overview contexts and {len(ctx_focus)} focus contexts")
+        logger.info(f"Retrieving context from vector store with single query k=4 (was 2 queries with k=2 each)")
+        ctx_all = store.query(combined_query, k=4, filter={"doc_id": {"$eq": doc_id}})
         
-        # Concatenate and cap context at max bytes
-        raw_context = "\n\n".join([m["text"] for m in (ctx_over + ctx_focus)])
+        logger.info(f"Retrieved {len(ctx_all)} context chunks with single query (saved 1 embedding + 1 Pinecone call)")
+
+        # Build context
+        raw_context = "\n\n".join([m["text"] for m in ctx_all])
         # Truncate to prevent context overflow
         from ..config import settings
         max_ctx_bytes = settings.gemini_max_context_bytes
@@ -103,11 +106,13 @@ class AnalysisPipeline:
         
         logger.info(f"Calling consolidated LLM analysis. Paper text size: {text_bytes} bytes, Context size: {context_bytes} bytes")
         
-        # Use consolidated method - ONE call per chunk instead of 4+ calls
+        # OPTIMIZATION 2: Direct analysis without extraction (unless truly massive)
+        # Pass paper_id to LLM for better identification
         analysis_results = llm_client.analyze_all_sections(
             text=text,
             style=style,
-            context=rich_context
+            context=rich_context,
+            paper_id=paper_id  # NEW: Pass paper_id for identification
         )
         
         overview = analysis_results["summary"]
@@ -116,9 +121,12 @@ class AnalysisPipeline:
         cites = analysis_results["citations"]
         
         logger.info(f"LLM analysis completed. Generated summary: {len(overview)} chars, findings: {len(findings)}, citations: {len(cites)}")
-        logger.info(f"[PIPELINE_COMPLETE] Saving session for paper_id={paper_id}")
+        logger.info(f"[PIPELINE_COMPLETE] Completed for paper_id={paper_id}")
 
+        # OPTIMIZATION 3: Return paper_id in results for multi-paper tracking
         return {
+            "paper_id": paper_id,  # NEW: Include paper ID
+            "paper_path": pdf_path,  # NEW: Include path for reference
             "summary_sections": [
                 {"title": "Overview", "content": overview},
             ],

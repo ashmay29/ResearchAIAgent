@@ -27,13 +27,9 @@ export default function Home() {
     if (!paperIds || paperIds.length === 0) return
     setStarting(true)
     try {
-      const jobIds: string[] = []
-      for (const id of paperIds) {
-        const { data } = await api.post('/analysis/run', { paper_id: id, options: opts })
-        jobIds.push(data.job_id)
-      }
-      // Navigate to the first job's analysis page
-      nav(`/analysis/${jobIds[0]}`)
+      // Optimized: single API call for batch analysis
+      const { data } = await api.post('/analysis/run', { paper_ids: paperIds, options: opts })
+      nav(`/analysis/${data.job_id}`)
     } finally {
       setStarting(false)
     }

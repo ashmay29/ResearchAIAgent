@@ -22,6 +22,7 @@ def _lazy_genai_configured() -> bool:
     api = settings.gemini_api_key
     if not api:
         return False
+    genai.configure(api_key=api)
     return True
 
 

@@ -94,59 +94,106 @@ def _gen_with_retry(parts: List[dict], max_output_tokens: int = 1024, call_info:
 
 
 def _parse_structured_response(response_text: str) -> Dict[str, any]:
-    """Parse structured response with section delimiters into a dict."""
+    """Parse structured response with section delimiters into a dict.
+
+    Supports both our strict format using "=== SECTION ===" and Markdown headings like
+    "## Summary", "## Critique", "## Key Findings", "## Citations".
+    """
     sections = {
         "summary": "",
         "critique": "",
         "key_findings": [],
         "citations": []
     }
-    
+
+    text = response_text or ""
+
     try:
-        # Split by section delimiters
-        parts = re.split(r'===\s*(\w+(?:\s+\w+)*)\s*===', response_text)
-        
-        # parts[0] is text before first delimiter (usually empty)
-        # parts[1::2] are section names, parts[2::2] are section contents
-        for i in range(1, len(parts), 2):
-            if i + 1 < len(parts):
-                section_name = parts[i].strip().upper().replace(" ", "_")
-                section_content = parts[i + 1].strip()
-                
-                if "SUMMARY" in section_name:
-                    sections["summary"] = section_content
-                elif "CRITIQUE" in section_name or "FEEDBACK" in section_name:
-                    sections["critique"] = section_content
-                elif "KEY" in section_name and "FINDING" in section_name:
-                    # Extract bullet points
-                    lines = section_content.splitlines()
-                    findings = [
-                        l.strip("- •*\t ") 
-                        for l in lines 
-                        if l.strip() and (l.strip().startswith("-") or l.strip().startswith("•") or l.strip().startswith("*"))
-                    ]
-                    sections["key_findings"] = findings
-                elif "CITATION" in section_name or "REFERENCE" in section_name:
-                    # Extract bullet points
-                    lines = section_content.splitlines()
-                    citations = [
-                        l.strip("- •*\t ") 
-                        for l in lines 
-                        if l.strip() and (l.strip().startswith("-") or l.strip().startswith("•") or l.strip().startswith("*"))
-                    ]
-                    sections["citations"] = citations
-        
-        # Fallback: if no delimiters found, treat entire response as summary
+        parsed_any = False
+
+        # 1) Try strict === SECTION === delimiters
+        strict_parts = re.split(r"===\s*([A-Za-z][A-Za-z\s/]+)\s*===", text)
+        if len(strict_parts) > 1:
+            parsed_any = True
+            for i in range(1, len(strict_parts), 2):
+                if i + 1 >= len(strict_parts):
+                    break
+                name = strict_parts[i].strip().upper()
+                content = strict_parts[i + 1].strip()
+                if "SUMMARY" in name:
+                    sections["summary"] = content
+                elif "CRITIQUE" in name or "FEEDBACK" in name:
+                    sections["critique"] = content
+                elif "KEY" in name and "FINDING" in name:
+                    sections["key_findings"] = _extract_bullets(content)
+                elif "CITATION" in name or "REFERENCE" in name:
+                    sections["citations"] = _extract_bullets(content)
+
+        # 2) If strict failed or incomplete, try Markdown headings ## Section
+        if not parsed_any or not (sections["summary"] and (sections["critique"] or sections["key_findings"] or sections["citations"])):
+            # Build a map of heading -> content using markdown style
+            md_regex = re.compile(r"^\s{0,3}#{2,3}\s*([A-Za-z][A-Za-z\s/]+)\s*$", re.MULTILINE)
+            spans = []
+            for m in md_regex.finditer(text):
+                spans.append((m.start(), m.end(), m.group(1).strip().upper()))
+            # Append end sentinel
+            spans.append((len(text), len(text), "END"))
+
+            for i in range(len(spans) - 1):
+                start, _, name = spans[i]
+                next_start, _, _ = spans[i + 1]
+                # Extract heading line to find content start
+                heading_line_end = text.find("\n", start)
+                if heading_line_end == -1:
+                    heading_line_end = start
+                content = text[heading_line_end:next_start].strip()
+                if not content:
+                    continue
+                if "SUMMARY" in name and not sections["summary"]:
+                    sections["summary"] = content
+                elif ("CRITIQUE" in name or "FEEDBACK" in name) and not sections["critique"]:
+                    sections["critique"] = content
+                elif "KEY" in name and "FINDING" in name and not sections["key_findings"]:
+                    sections["key_findings"] = _extract_bullets(content)
+                elif ("CITATION" in name or "REFERENCE" in name) and not sections["citations"]:
+                    sections["citations"] = _extract_bullets(content)
+
+        # 3) Final fallback heuristics
+        if not sections["key_findings"]:
+            # Try to find a block with many bullets
+            sections["key_findings"] = _extract_bullets(text)[:5]
+
+        if not sections["citations"]:
+            # Look for lines containing typical citation patterns (year in parentheses/brackets)
+            citation_like = []
+            for line in text.splitlines():
+                lt = line.strip()
+                if not lt:
+                    continue
+                if re.search(r"\((19|20)\d{2}\)|\[(19|20)\d{2}\]", lt):
+                    citation_like.append(lt.strip("- •*\t "))
+            sections["citations"] = citation_like[:5]
+
+        # 4) If still nothing parsed, treat entire text as summary
         if not sections["summary"] and not sections["critique"]:
-            logger.warning("No section delimiters found in response, using entire text as summary")
-            sections["summary"] = response_text
-            
+            logger.warning("No recognizable section delimiters found; using entire text as summary")
+            sections["summary"] = text
+
     except Exception as e:
         logger.error(f"Error parsing structured response: {e}")
-        # Fallback to treating entire response as summary
-        sections["summary"] = response_text
-    
+        sections["summary"] = text
+
     return sections
+
+
+def _extract_bullets(s: str) -> list[str]:
+    lines = s.splitlines()
+    bullets = [
+        l.strip("- •*\t ")
+        for l in lines
+        if l.strip() and (l.lstrip().startswith("-") or l.lstrip().startswith("•") or l.lstrip().startswith("*"))
+    ]
+    return bullets
 
 
 class LLMClient:

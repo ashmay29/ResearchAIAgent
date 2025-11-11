@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import { api } from '@/lib/api'
@@ -14,18 +14,45 @@ import { Download, Printer, Sparkles } from 'lucide-react'
 export default function AnalysisResult() {
   const { jobId } = useParams()
   const [status, setStatus] = useState('Loading analysis...')
-  const [result, setResult] = useState<any>(null)
+  const [resultsByPaper, setResultsByPaper] = useState<Record<string, any> | null>(null)
+  const [singleResult, setSingleResult] = useState<any>(null)
+  const [paperIds, setPaperIds] = useState<string[]>([])
+  const [selectedPaperId, setSelectedPaperId] = useState<string>('')
 
   useEffect(() => {
     let timer: any
     async function poll() {
-      const { data } = await api.get(`/analysis/status/${jobId}`)
-      if (data.status === 'done' || data.result) {
-        setResult(data.result)
-        setStatus('Completed')
-        clearInterval(timer)
-      } else {
+      try {
+        const { data } = await api.get(`/analysis/status/${jobId}`)
+        // New batch shape
+        if (data.status === 'done' && data.results) {
+          const results = data.results as Record<string, any>
+          const ids: string[] = (data.paper_ids && data.paper_ids.length > 0) ? data.paper_ids : Object.keys(results || {})
+          setResultsByPaper(results)
+          setPaperIds(ids)
+          if (!selectedPaperId && ids.length > 0) setSelectedPaperId(ids[0])
+          setStatus('Completed')
+          clearInterval(timer)
+          return
+        }
+        // Backward compat: old single result
+        if (data.status === 'done' && data.result) {
+          setSingleResult(data.result)
+          setStatus('Completed')
+          clearInterval(timer)
+          return
+        }
+        // Done but nothing to show: surface a friendly message instead of blank
+        if (data.status === 'done' && !data.results && !data.result) {
+          setStatus('Completed, but no results available for this job. Please check server logs.')
+          clearInterval(timer)
+          return
+        }
         setStatus(`Status: ${data.status} (${data.progress || 0}%)`)
+      } catch (err) {
+        console.error('Status polling failed', err)
+        setStatus('Failed to load status. Please refresh or check server logs.')
+        clearInterval(timer)
       }
     }
     poll()
@@ -33,7 +60,13 @@ export default function AnalysisResult() {
     return () => clearInterval(timer)
   }, [jobId])
 
-  if (!result) return <LoadingStatus status={status} />
+  // Resolve the result to display
+  const currentResult = useMemo(() => {
+    if (resultsByPaper && selectedPaperId) return resultsByPaper[selectedPaperId]
+    return singleResult
+  }, [resultsByPaper, selectedPaperId, singleResult])
+
+  if (!currentResult) return <LoadingStatus status={status} />
 
   return (
     <motion.div
@@ -47,11 +80,23 @@ export default function AnalysisResult() {
           <Sparkles className="h-8 w-8 text-blue-600 dark:text-blue-400" />
           Analysis Results
         </h2>
-        <div className="flex gap-3">
+        <div className="flex gap-3 items-center">
+          {resultsByPaper && paperIds.length > 1 && (
+            <select
+              className="px-3 py-2 border rounded-lg bg-white dark:bg-gray-900 dark:border-gray-800"
+              value={selectedPaperId}
+              onChange={(e) => setSelectedPaperId(e.target.value)}
+              title="Select paper"
+            >
+              {paperIds.map(id => (
+                <option key={id} value={id}>{id}</option>
+              ))}
+            </select>
+          )}
           <GradientButton
             variant="secondary"
             icon={<Download className="h-4 w-4" />}
-            onClick={() => exportMarkdown(result)}
+            onClick={() => exportMarkdown(currentResult)}
           >
             Export Markdown
           </GradientButton>
@@ -71,7 +116,7 @@ export default function AnalysisResult() {
         transition={{ delay: 0.2, staggerChildren: 0.1 }}
         className="space-y-6"
       >
-        {result.summary_sections?.map((s: any, idx: number) => (
+        {currentResult.summary_sections?.map((s: any, idx: number) => (
           <motion.div
             key={idx}
             initial={{ opacity: 0, x: -20 }}
@@ -82,29 +127,35 @@ export default function AnalysisResult() {
           </motion.div>
         ))}
         
-        <motion.div
-          initial={{ opacity: 0, x: -20 }}
-          animate={{ opacity: 1, x: 0 }}
-          transition={{ delay: 0.3 }}
-        >
-          <FeedbackSection feedback={result.feedback} />
-        </motion.div>
+        {!!(currentResult.feedback && currentResult.feedback.trim()) && (
+          <motion.div
+            initial={{ opacity: 0, x: -20 }}
+            animate={{ opacity: 1, x: 0 }}
+            transition={{ delay: 0.3 }}
+          >
+            <FeedbackSection feedback={currentResult.feedback} />
+          </motion.div>
+        )}
 
-        <motion.div
-          initial={{ opacity: 0, x: -20 }}
-          animate={{ opacity: 1, x: 0 }}
-          transition={{ delay: 0.4 }}
-        >
-          <FindingsList items={result.key_findings || []} />
-        </motion.div>
+        {!!(currentResult.key_findings && currentResult.key_findings.length) && (
+          <motion.div
+            initial={{ opacity: 0, x: -20 }}
+            animate={{ opacity: 1, x: 0 }}
+            transition={{ delay: 0.4 }}
+          >
+            <FindingsList items={currentResult.key_findings || []} />
+          </motion.div>
+        )}
 
-        <motion.div
-          initial={{ opacity: 0, x: -20 }}
-          animate={{ opacity: 1, x: 0 }}
-          transition={{ delay: 0.5 }}
-        >
-          <CitationViewer items={result.citations || []} />
-        </motion.div>
+        {!!(currentResult.citations && currentResult.citations.length) && (
+          <motion.div
+            initial={{ opacity: 0, x: -20 }}
+            animate={{ opacity: 1, x: 0 }}
+            transition={{ delay: 0.5 }}
+          >
+            <CitationViewer items={currentResult.citations || []} />
+          </motion.div>
+        )}
 
         <motion.div
           initial={{ opacity: 0, y: 20 }}

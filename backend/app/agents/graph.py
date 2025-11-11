@@ -119,6 +119,28 @@ class AnalysisPipeline:
         critique = analysis_results["critique"]
         findings = analysis_results["key_findings"]
         cites = analysis_results["citations"]
+
+        # Fallbacks: if any section is empty, derive them with lightweight single-purpose prompts
+        if not (critique or "").strip():
+            logger.info("Critique missing from consolidated analysis. Falling back to dedicated critique generation.")
+            try:
+                critique = llm_client.critique(text, context=rich_context)
+            except Exception as e:
+                logger.warning(f"Critique fallback failed: {e}")
+
+        if not findings:
+            logger.info("Key findings missing from consolidated analysis. Falling back to dedicated key findings generation.")
+            try:
+                findings = llm_client.key_findings(text, context=rich_context)
+            except Exception as e:
+                logger.warning(f"Key findings fallback failed: {e}")
+
+        if not cites:
+            logger.info("Citations missing from consolidated analysis. Falling back to dedicated citations extraction.")
+            try:
+                cites = llm_client.citations(text)
+            except Exception as e:
+                logger.warning(f"Citations fallback failed: {e}")
         
         logger.info(f"LLM analysis completed. Generated summary: {len(overview)} chars, findings: {len(findings)}, citations: {len(cites)}")
         logger.info(f"[PIPELINE_COMPLETE] Completed for paper_id={paper_id}")

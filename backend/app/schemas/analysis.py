@@ -1,4 +1,5 @@
 from pydantic import BaseModel, Field
+from pydantic import model_validator
 from enum import Enum
 from typing import Optional, List, Dict
 from .common import Citation
@@ -25,12 +26,27 @@ class AnalysisOptions(BaseModel):
     focus_area: FocusArea = Field(default=FocusArea.OVERALL)
     analysis_type: AnalysisType = Field(default=AnalysisType.SUMMARY)
 
-# UPDATED: Support multiple papers
+# UPDATED: Support multiple papers with backward compatibility for single paper_id
 class AnalysisRequest(BaseModel):
-    paper_ids: List[str] = Field(
+    paper_ids: Optional[List[str]] = Field(
+        default=None,
         description="List of paper IDs to analyze (supports batch analysis)"
     )
+    paper_id: Optional[str] = Field(
+        default=None,
+        description="Single paper ID (backward compatible)"
+    )
     options: AnalysisOptions = Field(default_factory=AnalysisOptions)
+
+    @model_validator(mode="after")
+    def _normalize_ids(self):
+        # If only paper_id is provided, convert to paper_ids
+        if (not self.paper_ids or len(self.paper_ids) == 0) and self.paper_id:
+            self.paper_ids = [self.paper_id]
+        # Validate presence
+        if not self.paper_ids or len(self.paper_ids) == 0:
+            raise ValueError("Either paper_ids (list) or paper_id (string) must be provided")
+        return self
 
 class Section(BaseModel):
     title: str
